@@ -42,8 +42,13 @@ RUN . $HOME/.local/bin/env \
     && uv pip install torch --index-url https://download.pytorch.org/whl/cu130
 
 # PufferLib + docs + 20k baseline experiments viewable with Constellation
+COPY patches/pufferlib-4.0-drone-forest.patch /tmp/pufferlib-4.0-drone-forest.patch
+COPY forest.sh /usr/local/bin/puffer-forest
+RUN chmod +x /usr/local/bin/puffer-forest
 RUN --mount=type=cache,target=/root/.ccache . $HOME/.local/bin/env \
     && git clone https://github.com/pufferai/pufferlib --branch 4.0 \
+    && git -C pufferlib checkout 42f70d6932c30ac977736f861006809c50168ba9 \
+    && git -C pufferlib apply /tmp/pufferlib-4.0-drone-forest.patch \
     && git clone https://github.com/pufferai/puffer.ai --branch 4.0 \
     && . venv/bin/activate \
     && cd pufferlib \

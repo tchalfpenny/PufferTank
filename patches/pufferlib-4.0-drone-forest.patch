@@ -1,0 +1,508 @@
+diff --git a/config/drone.ini b/config/drone.ini
+index b1ccd2e..3db9632 100644
+--- a/config/drone.ini
++++ b/config/drone.ini
+@@ -15,6 +15,7 @@ race_frac = 0.6878962707768624
+ sphere_frac = 0.0
+ cube_frac = 0.0
+ flag_frac = 0.0
++forest_frac = 0.0
+
+ # domain randomisation
+ dr = 0.05
+@@ -40,6 +41,20 @@ race_horizon = 2048
+ ring_reward = 2.4450236350884
+ race_alpha_dist = 2.8630645575928786
+
++# forest (enable with --env.hover-frac=0 --env.race-frac=0 --env.forest-frac=1)
++forest_tree_count = 24
++forest_tree_radius_min = 0.35
++forest_tree_radius_max = 0.7
++forest_sensor_range = 5.0
++forest_drone_radius = 0.2
++forest_goal_radius = 0.5
++forest_horizon = 3000
++forest_alpha_dist = 2.0
++forest_alpha_clearance = 0.01
++forest_clearance_target = 0.75
++forest_collision_penalty = 5.0
++forest_success_reward = 10.0
++
+ [policy]
+ expansion_factor = 1
+ hidden_size = 64
+@@ -123,4 +138,4 @@ scale = auto
+ distribution = uniform
+ min = 0.1
+ max = 1.0
+-scale = auto
+\ No newline at end of file
++scale = auto
+diff --git a/ocean/drone/binding.c b/ocean/drone/binding.c
+index ac07e08..62db017 100644
+--- a/ocean/drone/binding.c
++++ b/ocean/drone/binding.c
+@@ -31,6 +31,25 @@ static void race_config(DroneEnv* env, Dict* kwargs) {
+     env->task_config = cfg;
+ }
+
++static void forest_config(DroneEnv* env, Dict* kwargs) {
++    ForestConfig* cfg = (ForestConfig*)calloc(1, sizeof(ForestConfig));
++    cfg->tree_count = (int)dict_get(kwargs, "forest_tree_count")->value;
++    if (cfg->tree_count < 0) cfg->tree_count = 0;
++    if (cfg->tree_count > FOREST_MAX_TREES) cfg->tree_count = FOREST_MAX_TREES;
++    cfg->tree_radius_min = dict_get(kwargs, "forest_tree_radius_min")->value;
++    cfg->tree_radius_max = dict_get(kwargs, "forest_tree_radius_max")->value;
++    cfg->sensor_range = dict_get(kwargs, "forest_sensor_range")->value;
++    cfg->drone_radius = dict_get(kwargs, "forest_drone_radius")->value;
++    cfg->goal_radius = dict_get(kwargs, "forest_goal_radius")->value;
++    cfg->alpha_dist = dict_get(kwargs, "forest_alpha_dist")->value;
++    cfg->alpha_clearance = dict_get(kwargs, "forest_alpha_clearance")->value;
++    cfg->clearance_target = dict_get(kwargs, "forest_clearance_target")->value;
++    cfg->collision_penalty = dict_get(kwargs, "forest_collision_penalty")->value;
++    cfg->success_reward = dict_get(kwargs, "forest_success_reward")->value;
++    cfg->horizon = (int)dict_get(kwargs, "forest_horizon")->value;
++    env->task_config = cfg;
++}
++
+ void my_init(Env* env, Dict* kwargs) {
+     env->num_agents = (int)dict_get(kwargs, "num_drones")->value;
+
+@@ -46,6 +65,7 @@ void my_init(Env* env, Dict* kwargs) {
+     task_fracs[TASK_SPHERE] = dict_get(kwargs, "sphere_frac")->value;
+     task_fracs[TASK_CUBE] = dict_get(kwargs, "cube_frac")->value;
+     task_fracs[TASK_FLAG] = dict_get(kwargs, "flag_frac")->value;
++    task_fracs[TASK_FOREST] = dict_get(kwargs, "forest_frac")->value;
+
+     float total = 0.0f;
+     for (int t = 0; t < NUM_TASKS; t++) {
+@@ -65,6 +85,8 @@ void my_init(Env* env, Dict* kwargs) {
+
+     if (env->task == TASK_RACE) {
+         race_config(env, kwargs);
++    } else if (env->task == TASK_FOREST) {
++        forest_config(env, kwargs);
+     } else {
+         hover_config(env, kwargs);
+     }
+@@ -142,6 +164,16 @@ void my_log(Log* log, Dict* out) {
+         dict_set(out, "flag/oob", task_avg(f->keys[3], f->n));
+         dict_set(out, "flag/episode_frac", f->n);
+     }
++    if (log->task[TASK_FOREST].n > 0.0f || (first && task_fracs[TASK_FOREST] > 0.0f)) {
++        TaskLog* f = &log->task[TASK_FOREST];
++        dict_set(out, "forest/perf", task_avg(f->perf, f->n));
++        dict_set(out, "forest/score", task_avg(f->score, f->n));
++        dict_set(out, "forest/success", task_avg(f->keys[0], f->n));
++        dict_set(out, "forest/collision", task_avg(f->keys[1], f->n));
++        dict_set(out, "forest/min_clearance", task_avg(f->keys[2], f->n));
++        dict_set(out, "forest/oob", task_avg(f->keys[3], f->n));
++        dict_set(out, "forest/episode_frac", f->n);
++    }
+
+     first = 0;
+-}
+\ No newline at end of file
++}
+diff --git a/ocean/drone/drone.c b/ocean/drone/drone.c
+index aa3c19e..644f211 100644
+--- a/ocean/drone/drone.c
++++ b/ocean/drone/drone.c
+@@ -17,6 +17,21 @@ static void setup_task(DroneEnv* env, int task) {
+         cfg->max_rings = 10;
+         cfg->horizon = 2048;
+         env->task_config = cfg;
++    } else if (task == TASK_FOREST) {
++        ForestConfig* cfg = (ForestConfig*)calloc(1, sizeof(ForestConfig));
++        cfg->tree_count = 24;
++        cfg->tree_radius_min = 0.35f;
++        cfg->tree_radius_max = 0.7f;
++        cfg->sensor_range = 5.0f;
++        cfg->drone_radius = 0.2f;
++        cfg->goal_radius = 0.5f;
++        cfg->alpha_dist = 2.0f;
++        cfg->alpha_clearance = 0.01f;
++        cfg->clearance_target = 0.75f;
++        cfg->collision_penalty = 5.0f;
++        cfg->success_reward = 10.0f;
++        cfg->horizon = 3000;
++        env->task_config = cfg;
+     } else {
+         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
+         cfg->target_dist = 5.0f;
+@@ -68,7 +83,7 @@ int main(int argc, char** argv) {
+     int task = argc > 1 ? atoi(argv[1]) : TASK_RACE;
+
+     DroneEnv* env = calloc(1, sizeof(DroneEnv));
+-    env->num_agents = 64;
++    env->num_agents = task == TASK_FOREST ? 1 : 64;
+     env->dr = 0.05f;  // static 5% flat DR for the demo
+
+     env->observations = (float*)calloc(env->num_agents * DRONE_OBS_SIZE, sizeof(float));
+@@ -107,4 +122,4 @@ int main(int argc, char** argv) {
+ #endif
+
+     return 0;
+-}
+\ No newline at end of file
++}
+diff --git a/ocean/drone/drone.h b/ocean/drone/drone.h
+index cb8ffac..ae5b9df 100644
+--- a/ocean/drone/drone.h
++++ b/ocean/drone/drone.h
+@@ -19,9 +19,10 @@ typedef enum {
+     TASK_SPHERE = 2,
+     TASK_CUBE = 3,
+     TASK_FLAG = 4,
++    TASK_FOREST = 5,
+ } TaskType;
+
+-#define NUM_TASKS 5
++#define NUM_TASKS 6
+
+ typedef struct {
+     float dist;
+@@ -113,8 +114,13 @@ void reset_agent(DroneEnv* env, int idx) {
+
+ void compute_observations(DroneEnv* env) {
+     bool is_race = (env->task == TASK_RACE);
+-    for (int i = 0; i < env->num_agents; i++)
++    for (int i = 0; i < env->num_agents; i++) {
+         compute_drone_observations(&env->agents[i], env->observations + i * DRONE_OBS_SIZE, is_race);
++        if (env->task == TASK_FOREST) {
++            forest_write_observations(env, &env->agents[i],
++                                      env->observations + i * DRONE_OBS_SIZE);
++        }
++    }
+ }
+
+ void c_reset(DroneEnv* env) {
+@@ -185,4 +191,4 @@ void c_close(DroneEnv* env) {
+     physics_close(&env->physics);
+
+     if (env->client != NULL) c_close_client(env->client);
+-}
+\ No newline at end of file
++}
+diff --git a/ocean/drone/render.h b/ocean/drone/render.h
+index 7b88320..318e051 100644
+--- a/ocean/drone/render.h
++++ b/ocean/drone/render.h
+@@ -415,11 +415,25 @@ void DrawDronePrimitive(Client* client, Drone* agent, float* actions, Color body
+ // Task-specific overlays
+ static void render_task(DroneEnv* env, Client* client) {
+     (void)client;
+-    if (env->task != TASK_RACE) return;
+-    RaceConfig* cfg = (RaceConfig*)env->task_config;
+-    RaceState* state = (RaceState*)env->task_state;
+-    for (int i = 0; i < cfg->max_rings; i++)
+-        DrawRing3D(state->ring_buffer[i], 0.1f, GREEN, BLUE);
++    if (env->task == TASK_RACE) {
++        RaceConfig* cfg = (RaceConfig*)env->task_config;
++        RaceState* state = (RaceState*)env->task_state;
++        for (int i = 0; i < cfg->max_rings; i++)
++            DrawRing3D(state->ring_buffer[i], 0.1f, GREEN, BLUE);
++    } else if (env->task == TASK_FOREST) {
++        ForestConfig* cfg = (ForestConfig*)env->task_config;
++        ForestState* state = (ForestState*)env->task_state;
++        const Color trunk = (Color){104, 72, 45, 255};
++        const Color canopy = (Color){30, 105, 52, 255};
++        for (int i = 0; i < cfg->tree_count; i++) {
++            ForestTree* tree = &state->trees[i];
++            Vector3 bottom = {tree->pos.x, tree->pos.y, -GRID_Z};
++            Vector3 top = {tree->pos.x, tree->pos.y, GRID_Z};
++            DrawCylinderEx(bottom, top, tree->radius, tree->radius, 12, trunk);
++            DrawSphere((Vector3){tree->pos.x, tree->pos.y, GRID_Z - 0.5f},
++                       tree->radius * 1.8f, canopy);
++        }
++    }
+ }
+
+ void c_render(DroneEnv* env) {
+@@ -646,4 +660,4 @@ void c_render(DroneEnv* env) {
+              inspect_mode ? PUFF_GREEN : LIGHTGRAY);
+
+     EndDrawing();
+-}
+\ No newline at end of file
++}
+diff --git a/ocean/drone/task_forest.h b/ocean/drone/task_forest.h
+new file mode 100644
+index 0000000..d8fd884
+--- /dev/null
++++ b/ocean/drone/task_forest.h
+@@ -0,0 +1,199 @@
++#pragma once
++
++#include "drone.h"
++
++#define FOREST_MAX_TREES 64
++#define FOREST_NUM_RAYS 8
++#define FOREST_OBS_OFFSET 13
++#define FOREST_EPSILON 1e-6f
++
++typedef struct {
++    Vec3 pos;
++    float radius;
++} ForestTree;
++
++typedef struct {
++    int tree_count;
++    float tree_radius_min;
++    float tree_radius_max;
++    float sensor_range;
++    float drone_radius;
++    float goal_radius;
++    float alpha_dist;
++    float alpha_clearance;
++    float clearance_target;
++    float collision_penalty;
++    float success_reward;
++    int horizon;
++} ForestConfig;
++
++typedef struct {
++    ForestTree trees[FOREST_MAX_TREES];
++    unsigned char* collided;
++    unsigned char* succeeded;
++    float* min_clearance;
++} ForestState;
++
++static inline float forest_dist_xy(Vec3 a, Vec3 b) {
++    float dx = a.x - b.x;
++    float dy = a.y - b.y;
++    return sqrtf(dx * dx + dy * dy);
++}
++
++static inline bool forest_tree_overlaps(const ForestState* state, int count, Vec3 pos,
++                                        float radius, float margin) {
++    for (int i = 0; i < count; i++) {
++        const ForestTree* tree = &state->trees[i];
++        if (forest_dist_xy(tree->pos, pos) < tree->radius + radius + margin) return true;
++    }
++    return false;
++}
++
++static void forest_generate(DroneEnv* env) {
++    ForestConfig* cfg = (ForestConfig*)env->task_config;
++    ForestState* state = (ForestState*)env->task_state;
++    const Vec3 start = {-MARGIN_X, 0.0f, 0.0f};
++    const Vec3 goal = {MARGIN_X, 0.0f, 0.0f};
++
++    int count = 0;
++    int attempts = 0;
++    int max_attempts = cfg->tree_count * 32;
++    while (count < cfg->tree_count && attempts++ < max_attempts) {
++        ForestTree candidate = {
++            .pos = {rndf(-MARGIN_X + 1.5f, MARGIN_X - 1.5f, &env->rng),
++                    rndf(-MARGIN_Y + 1.0f, MARGIN_Y - 1.0f, &env->rng), 0.0f},
++            .radius = rndf(cfg->tree_radius_min, cfg->tree_radius_max, &env->rng),
++        };
++        if (forest_dist_xy(candidate.pos, start) < candidate.radius + 1.5f) continue;
++        if (forest_dist_xy(candidate.pos, goal) < candidate.radius + 1.5f) continue;
++        if (forest_tree_overlaps(state, count, candidate.pos, candidate.radius, 0.35f)) continue;
++        state->trees[count++] = candidate;
++    }
++    cfg->tree_count = count;
++}
++
++static inline float forest_ray_distance(const ForestConfig* cfg, const ForestState* state,
++                                        Vec3 origin, Vec3 direction) {
++    float nearest = cfg->sensor_range;
++    for (int i = 0; i < cfg->tree_count; i++) {
++        const ForestTree* tree = &state->trees[i];
++        float ox = origin.x - tree->pos.x;
++        float oy = origin.y - tree->pos.y;
++        float b = ox * direction.x + oy * direction.y;
++        float c = ox * ox + oy * oy - tree->radius * tree->radius;
++        float disc = b * b - c;
++        if (disc < 0.0f) continue;
++        float root = sqrtf(disc);
++        float t = -b - root;
++        if (t < 0.0f) t = -b + root;
++        if (t >= 0.0f && t < nearest) nearest = t;
++    }
++    return nearest;
++}
++
++static float forest_clearance(const ForestConfig* cfg, const ForestState* state, Vec3 pos) {
++    float nearest = cfg->sensor_range;
++    for (int i = 0; i < cfg->tree_count; i++) {
++        float clearance = forest_dist_xy(pos, state->trees[i].pos) - state->trees[i].radius;
++        nearest = fminf(nearest, clearance);
++    }
++    return nearest;
++}
++
++static bool forest_collides(const ForestConfig* cfg, const ForestState* state, Vec3 pos) {
++    return forest_clearance(cfg, state, pos) <= cfg->drone_radius;
++}
++
++static void forest_write_observations(DroneEnv* env, Drone* agent, float* observations) {
++    ForestConfig* cfg = (ForestConfig*)env->task_config;
++    ForestState* state = (ForestState*)env->task_state;
++    for (int i = 0; i < FOREST_NUM_RAYS; i++) {
++        float angle = 2.0f * (float)M_PI * (float)i / (float)FOREST_NUM_RAYS;
++        Vec3 body_ray = {cosf(angle), sinf(angle), 0.0f};
++        Vec3 world_ray = quat_rotate(agent->state.quat, body_ray);
++        float horizontal_len = sqrtf(world_ray.x * world_ray.x + world_ray.y * world_ray.y);
++        if (horizontal_len > FOREST_EPSILON) {
++            world_ray.x /= horizontal_len;
++            world_ray.y /= horizontal_len;
++        } else {
++            world_ray = body_ray;
++        }
++        float distance = forest_ray_distance(cfg, state, agent->state.pos, world_ray);
++        observations[FOREST_OBS_OFFSET + i] = clampf(distance / cfg->sensor_range, 0.0f, 1.0f);
++    }
++}
++
++static void forest_init(DroneEnv* env) {
++    ForestState* state = (ForestState*)calloc(1, sizeof(ForestState));
++    state->collided = (unsigned char*)calloc(env->num_agents, sizeof(unsigned char));
++    state->succeeded = (unsigned char*)calloc(env->num_agents, sizeof(unsigned char));
++    state->min_clearance = (float*)calloc(env->num_agents, sizeof(float));
++    env->task_state = state;
++}
++
++static void forest_close(DroneEnv* env) {
++    ForestState* state = (ForestState*)env->task_state;
++    if (state != NULL) {
++        free(state->collided);
++        free(state->succeeded);
++        free(state->min_clearance);
++        free(state);
++    }
++    free(env->task_config);
++}
++
++static void forest_reset(DroneEnv* env, Drone* agent, int idx) {
++    ForestConfig* cfg = (ForestConfig*)env->task_config;
++    ForestState* state = (ForestState*)env->task_state;
++    if (idx == 0) forest_generate(env);
++
++    agent->state.pos = (Vec3){-MARGIN_X, rndf(-0.5f, 0.5f, &env->rng),
++                              rndf(-1.0f, 1.0f, &env->rng)};
++    agent->target->pos = (Vec3){MARGIN_X, rndf(-0.5f, 0.5f, &env->rng),
++                                rndf(-1.0f, 1.0f, &env->rng)};
++    agent->target->vel = (Vec3){0.0f, 0.0f, 0.0f};
++    agent->target->normal = (Vec3){0.0f, 0.0f, 0.0f};
++    state->collided[idx] = 0;
++    state->succeeded[idx] = 0;
++    state->min_clearance[idx] = cfg->sensor_range;
++}
++
++static float forest_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
++    ForestConfig* cfg = (ForestConfig*)env->task_config;
++    ForestState* state = (ForestState*)env->task_state;
++    float clearance = forest_clearance(cfg, state, agent->state.pos);
++    state->min_clearance[idx] = fminf(state->min_clearance[idx], clearance);
++
++    float reward = cfg->alpha_dist * (cache->prev_dist - cache->dist);
++    if (clearance < cfg->clearance_target) {
++        float unsafe = (cfg->clearance_target - clearance) / cfg->clearance_target;
++        reward -= cfg->alpha_clearance * clampf(unsafe, 0.0f, 1.0f);
++    }
++
++    state->collided[idx] = forest_collides(cfg, state, agent->state.pos);
++    state->succeeded[idx] = cache->dist <= cfg->goal_radius;
++    if (state->collided[idx]) reward -= cfg->collision_penalty;
++    if (state->succeeded[idx]) reward += cfg->success_reward;
++    return reward;
++}
++
++static bool forest_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
++    ForestConfig* cfg = (ForestConfig*)env->task_config;
++    ForestState* state = (ForestState*)env->task_state;
++    return state->collided[idx] || state->succeeded[idx] || out_of_bounds(agent->state.pos, 1.0f) ||
++           agent->episode_length >= cfg->horizon;
++}
++
++static void forest_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
++    (void)agent;
++    (void)cache;
++    ForestState* state = (ForestState*)env->task_state;
++    TaskLog* task = &log->task[TASK_FOREST];
++    task->n += 1.0f;
++    task->perf += state->succeeded[idx] ? 1.0f : 0.0f;
++    task->score += state->succeeded[idx] ? 1.0f : 0.0f;
++    task->keys[0] += state->succeeded[idx] ? 1.0f : 0.0f;
++    task->keys[1] += state->collided[idx] ? 1.0f : 0.0f;
++    task->keys[2] += state->min_clearance[idx];
++    task->keys[3] += out_of_bounds(agent->state.pos, 1.0f) ? 1.0f : 0.0f;
++}
+diff --git a/ocean/drone/tasklib.h b/ocean/drone/tasklib.h
+index 8eec90c..0845ec3 100644
+--- a/ocean/drone/tasklib.h
++++ b/ocean/drone/tasklib.h
+@@ -2,6 +2,7 @@
+
+ #include "task_hover.h"
+ #include "task_race.h"
++#include "task_forest.h"
+
+
+ const char* task_name(TaskType task) {
+@@ -11,6 +12,7 @@ const char* task_name(TaskType task) {
+         case TASK_SPHERE: return "sphere";
+         case TASK_CUBE: return "cube";
+         case TASK_FLAG: return "flag";
++        case TASK_FOREST: return "forest";
+     }
+     return "?";
+ }
+@@ -18,6 +20,7 @@ const char* task_name(TaskType task) {
+ int task_horizon(DroneEnv* env) {
+     switch (env->task) {
+         case TASK_RACE: return ((RaceConfig*)env->task_config)->horizon;
++        case TASK_FOREST: return ((ForestConfig*)env->task_config)->horizon;
+         default: return ((HoverConfig*)env->task_config)->horizon;
+     }
+ }
+@@ -25,6 +28,7 @@ int task_horizon(DroneEnv* env) {
+ void task_init(DroneEnv* env) {
+     switch (env->task) {
+         case TASK_RACE: race_init(env); break;
++        case TASK_FOREST: forest_init(env); break;
+         default: hover_init(env); break;
+     }
+ }
+@@ -32,6 +36,7 @@ void task_init(DroneEnv* env) {
+ void task_close(DroneEnv* env) {
+     switch (env->task) {
+         case TASK_RACE: race_close(env); break;
++        case TASK_FOREST: forest_close(env); break;
+         default: hover_close(env); break;
+     }
+ }
+@@ -50,12 +55,14 @@ void task_reset(DroneEnv* env, Drone* agent, int idx) {
+         case TASK_CUBE: cube_reset(env, agent, idx); break;
+         case TASK_FLAG: flag_reset(env, agent, idx); break;
+         case TASK_RACE: race_reset(env, agent, idx); break;
++        case TASK_FOREST: forest_reset(env, agent, idx); break;
+     }
+ }
+
+ float task_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
+     switch (env->task) {
+         case TASK_RACE: return race_reward(env, agent, idx, cache);
++        case TASK_FOREST: return forest_reward(env, agent, idx, cache);
+         default: return hover_reward(env, agent, idx, cache);
+     }
+ }
+@@ -63,6 +70,7 @@ float task_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
+ bool task_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
+     switch (env->task) {
+         case TASK_RACE: return race_done(env, agent, idx, cache);
++        case TASK_FOREST: return forest_done(env, agent, idx, cache);
+         default: return hover_done(env, agent, idx, cache);
+     }
+ }
+@@ -70,6 +78,7 @@ bool task_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
+ void task_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
+     switch (env->task) {
+         case TASK_RACE: race_log(env, agent, idx, log, cache); break;
++        case TASK_FOREST: forest_log(env, agent, idx, log, cache); break;
+         default: hover_log(env, agent, idx, log, cache); break;
+     }
+ }

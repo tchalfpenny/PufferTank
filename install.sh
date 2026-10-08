@@ -4,6 +4,8 @@ set -e
 # PufferLib standalone installer
 # Assumes Ubuntu 24.04 with CUDA 13.0 drivers already installed
 
+PUFFERTANK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 apt-get update && apt-get install -y \
     curl git build-essential clang \
     htop gdb tmux ccache \
@@ -21,6 +23,8 @@ uv venv --python 3.12 venv
 . venv/bin/activate
 
 git clone https://github.com/pufferai/pufferlib --branch 4.0
+git -C pufferlib checkout 42f70d6932c30ac977736f861006809c50168ba9
+git -C pufferlib apply "$PUFFERTANK_DIR/patches/pufferlib-4.0-drone-forest.patch"
 cd pufferlib
 
 CUDA_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K\d+\.\d+' | tr -d '.')
@@ -28,4 +32,4 @@ uv pip install torch --extra-index-url "https://download.pytorch.org/whl/cu${CUD
 uv pip install -e .
 
 bash build.sh breakout
-echo "Done. Test your installation with: puffer train breakout"
+echo "Done. Build and train the forest prototype with: $PUFFERTANK_DIR/forest.sh train"
